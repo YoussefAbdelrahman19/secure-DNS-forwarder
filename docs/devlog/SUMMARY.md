@@ -11,3 +11,4 @@
 - 2026-04-02T19:47:55.087Z :: dns-server :: documented dns forwarding behavior
 - 2026-04-02T19:48:01.425Z :: dns-server :: updated resolver timeout handling
 - 2026-04-02T19:48:02.249Z :: dns-server :: added tls validation notes
+- 2026-04-02T19:48:03.073Z :: dns-server :: documented dns forwarding behavior
