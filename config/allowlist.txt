@@ -1,0 +1,3 @@
+# one suffix or exact domain per line
+# example:
+# important.example

@@ -1,0 +1,52 @@
+server:
+  bind_address: "0.0.0.0"
+  port: 53
+  tcp_backlog: 256
+  udp_workers: 8
+  tcp_client_timeout_seconds: 10
+  max_udp_packet_size: 4096
+
+metrics:
+  enabled: true
+  bind_address: "127.0.0.1"
+  port: 9100
+
+cache:
+  enabled: true
+  max_entries: 50000
+  min_ttl_seconds: 5
+  max_ttl_seconds: 3600
+  negative_ttl_seconds: 60
+
+policy:
+  block_response_code: "REFUSED"
+  allowlist_path: "config/allowlist.txt"
+  blocklist_path: "config/blocklist.txt"
+  rate_limit:
+    enabled: true
+    requests_per_second_per_client: 150
+    burst: 200
+
+upstreams:
+  - name: "cloudflare-primary"
+    address: "1.1.1.1"
+    port: 853
+    sni_hostname: "cloudflare-dns.com"
+    connect_timeout_seconds: 3
+    read_timeout_seconds: 5
+    write_timeout_seconds: 5
+    pool_size: 16
+    failure_cooldown_seconds: 10
+  - name: "cloudflare-secondary"
+    address: "1.0.0.1"
+    port: 853
+    sni_hostname: "cloudflare-dns.com"
+    connect_timeout_seconds: 3
+    read_timeout_seconds: 5
+    write_timeout_seconds: 5
+    pool_size: 16
+    failure_cooldown_seconds: 10
+
+logging:
+  level: "info"
+  json: true

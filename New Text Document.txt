@@ -1,0 +1,1620 @@
+DNServe Production-Grade Secure DNS Forwarder (single text bundle)
+================================================================================
+Each section starts with: ===== FILE: path =====
+Recreate the project by splitting each section into its own file.
+
+===== FILE: Dockerfile =====
+FROM ruby:3.3-alpine
+
+WORKDIR /app
+
+RUN apk add --no-cache build-base tzdata
+
+COPY Gemfile ./
+RUN bundle install
+
+COPY . .
+
+EXPOSE 53/udp 53/tcp 9100/tcp
+
+CMD ["bundle", "exec", "bin/dnsserve", "-c", "config/default.yml"]
+
+===== FILE: Gemfile =====
+source "https://rubygems.org"
+
+gem "rspec"
+
+===== FILE: README.md =====
+# DNServe
+
+DNServe is a production-oriented local DNS forwarding server written in Ruby.
+It listens on UDP/TCP port 53, applies policy controls, caches answers, exports
+Prometheus-style metrics, and forwards queries upstream over DNS-over-TLS (DoT).
+
+## Features
+
+- UDP and TCP DNS listeners
+- Upstream DNS-over-TLS with certificate validation and SNI
+- Multiple upstreams with failover and connection pooling
+- TTL-aware cache
+- Domain blocklist and allowlist
+- Per-client rate limiting
+- Structured JSON logging
+- Prometheus-compatible `/metrics` endpoint
+- Docker and systemd deployment examples
+- RSpec unit tests
+
+## Scope
+
+This is a forwarding resolver / secure DNS proxy, not a full recursive resolver
+and not an authoritative DNS server. It is intended for local, edge, lab,
+enterprise branch, and controlled production deployments where forwarding to
+trusted recursive resolvers is preferred.
+
+## Run
+
+```bash
+bundle install
+bundle exec bin/dnsserve -c config/default.yml
+```
+
+## Metrics
+
+- `GET /metrics`
+- `GET /healthz`
+
+Default metrics bind:
+- `127.0.0.1:9100`
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+## Notes
+
+- Port 53 normally requires root or CAP_NET_BIND_SERVICE.
+- Always validate the configuration and deploy behind phased rollout.
+- Add your own blocklists and allowlists based on policy.
+
+===== FILE: bin/dnsserve =====
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+
+require "optparse"
+require "dnsserve"
+
+options = {
+  config: File.expand_path("../config/default.yml", __dir__)
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: dnsserve -c config.yml"
+
+  opts.on("-c", "--config PATH", "Path to YAML config") do |path|
+    options[:config] = path
+  end
+end
+
+parser.parse!
+
+config = DNServe::Config.load(options[:config])
+server = DNServe::Server.new(config)
+server.start
+
+===== FILE: config/allowlist.txt =====
+# one suffix or exact domain per line
+# example:
+# important.example
+
+===== FILE: config/blocklist.txt =====
+# one suffix or exact domain per line
+# example:
+# bad.example
+
+===== FILE: config/default.yml =====
+server:
+  bind_address: "0.0.0.0"
+  port: 53
+  tcp_backlog: 256
+  udp_workers: 8
+  tcp_client_timeout_seconds: 10
+  max_udp_packet_size: 4096
+
+metrics:
+  enabled: true
+  bind_address: "127.0.0.1"
+  port: 9100
+
+cache:
+  enabled: true
+  max_entries: 50000
+  min_ttl_seconds: 5
+  max_ttl_seconds: 3600
+  negative_ttl_seconds: 60
+
+policy:
+  block_response_code: "REFUSED"
+  allowlist_path: "config/allowlist.txt"
+  blocklist_path: "config/blocklist.txt"
+  rate_limit:
+    enabled: true
+    requests_per_second_per_client: 150
+    burst: 200
+
+upstreams:
+  - name: "cloudflare-primary"
+    address: "1.1.1.1"
+    port: 853
+    sni_hostname: "cloudflare-dns.com"
+    connect_timeout_seconds: 3
+    read_timeout_seconds: 5
+    write_timeout_seconds: 5
+    pool_size: 16
+    failure_cooldown_seconds: 10
+  - name: "cloudflare-secondary"
+    address: "1.0.0.1"
+    port: 853
+    sni_hostname: "cloudflare-dns.com"
+    connect_timeout_seconds: 3
+    read_timeout_seconds: 5
+    write_timeout_seconds: 5
+    pool_size: 16
+    failure_cooldown_seconds: 10
+
+logging:
+  level: "info"
+  json: true
+
+===== FILE: docker-compose.yml =====
+services:
+  dnsserve:
+    build: .
+    container_name: dnsserve
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9100:9100/tcp"
+    cap_add:
+      - NET_BIND_SERVICE
+    restart: unless-stopped
+
+===== FILE: lib/dnsserve.rb =====
+# frozen_string_literal: true
+
+require "yaml"
+require "json"
+require "socket"
+require "openssl"
+require "timeout"
+require "logger"
+require "thread"
+require "webrick"
+
+require_relative "dnsserve/version"
+require_relative "dnsserve/config"
+require_relative "dnsserve/json_logger"
+require_relative "dnsserve/metrics"
+require_relative "dnsserve/cache"
+require_relative "dnsserve/blocklist"
+require_relative "dnsserve/rate_limiter"
+require_relative "dnsserve/dns/message"
+require_relative "dnsserve/upstream/dot_pool"
+require_relative "dnsserve/upstream/router"
+require_relative "dnsserve/query_processor"
+require_relative "dnsserve/udp_server"
+require_relative "dnsserve/tcp_server"
+require_relative "dnsserve/metrics_server"
+require_relative "dnsserve/server"
+
+===== FILE: lib/dnsserve/blocklist.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class Blocklist
+    def initialize(blocklist_path:, allowlist_path:)
+      @block_entries = load_entries(blocklist_path)
+      @allow_entries = load_entries(allowlist_path)
+    end
+
+    def blocked?(domain)
+      normalized = normalize(domain)
+      return false if normalized.nil? || normalized.empty?
+      return false if match_any?(@allow_entries, normalized)
+
+      match_any?(@block_entries, normalized)
+    end
+
+    private
+
+    def load_entries(path)
+      return [] if path.nil? || !File.exist?(path)
+
+      File.readlines(path, chomp: true)
+          .map(&:strip)
+          .reject { |line| line.empty? || line.start_with?("#") }
+          .map { |line| normalize(line) }
+          .compact
+          .uniq
+    end
+
+    def normalize(name)
+      name.to_s.downcase.gsub(/\.+$/, "")
+    end
+
+    def match_any?(entries, domain)
+      entries.any? do |entry|
+        domain == entry || domain.end_with?(".#{entry}")
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/cache.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class Cache
+    Entry = Struct.new(:expires_at, :response_template)
+
+    def initialize(enabled:, max_entries:, min_ttl_seconds:, max_ttl_seconds:, negative_ttl_seconds:)
+      @enabled = enabled
+      @max_entries = max_entries
+      @min_ttl_seconds = min_ttl_seconds
+      @max_ttl_seconds = max_ttl_seconds
+      @negative_ttl_seconds = negative_ttl_seconds
+      @store = {}
+      @mutex = Mutex.new
+    end
+
+    def enabled?
+      @enabled
+    end
+
+    def fetch(query)
+      return nil unless enabled?
+
+      key = query.cache_key
+      now = Process.clock_gettime(Process::CLOCK_REALTIME)
+
+      @mutex.synchronize do
+        purge_expired!(now)
+        entry = @store[key]
+        return nil unless entry
+        return nil if entry.expires_at <= now
+
+        patch_transaction_id(entry.response_template, query.id)
+      end
+    end
+
+    def write(query, response)
+      return unless enabled?
+
+      ttl = response.cache_ttl_seconds(negative_ttl_seconds: @negative_ttl_seconds)
+      ttl = [[ttl, @min_ttl_seconds].max, @max_ttl_seconds].min
+      expires_at = Process.clock_gettime(Process::CLOCK_REALTIME) + ttl
+
+      @mutex.synchronize do
+        evict_if_needed!
+        @store[query.cache_key] = Entry.new(expires_at, normalize_transaction_id(response.raw))
+      end
+    end
+
+    private
+
+    attr_reader :negative_ttl_seconds
+
+    def purge_expired!(now)
+      @store.delete_if { |_k, v| v.expires_at <= now }
+    end
+
+    def evict_if_needed!
+      return if @store.length < @max_entries
+
+      oldest_key, _oldest_entry = @store.min_by { |_k, entry| entry.expires_at }
+      @store.delete(oldest_key)
+    end
+
+    def normalize_transaction_id(raw)
+      data = raw.dup
+      data[0, 2] = [0].pack("n")
+      data
+    end
+
+    def patch_transaction_id(raw, id)
+      data = raw.dup
+      data[0, 2] = [id].pack("n")
+      data
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/config.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class Config
+    def self.load(path)
+      raw = YAML.load_file(path)
+      new(deep_symbolize(raw), File.expand_path("..", path))
+    end
+
+    attr_reader :root_dir
+
+    def initialize(data, root_dir = Dir.pwd)
+      @data = data
+      @root_dir = root_dir
+    end
+
+    def [](key)
+      @data.fetch(key)
+    end
+
+    def server
+      @data.fetch(:server)
+    end
+
+    def metrics
+      @data.fetch(:metrics)
+    end
+
+    def cache
+      @data.fetch(:cache)
+    end
+
+    def policy
+      @data.fetch(:policy)
+    end
+
+    def upstreams
+      @data.fetch(:upstreams)
+    end
+
+    def logging
+      @data.fetch(:logging)
+    end
+
+    def resolve_path(path)
+      return nil if path.nil? || path.empty?
+      return path if path.start_with?("/")
+
+      File.expand_path(path, root_dir)
+    end
+
+    def self.deep_symbolize(value)
+      case value
+      when Hash
+        value.each_with_object({}) do |(k, v), acc|
+          acc[k.to_sym] = deep_symbolize(v)
+        end
+      when Array
+        value.map { |v| deep_symbolize(v) }
+      else
+        value
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/dns/message.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  module DNS
+    class ParseError < StandardError; end
+
+    class Message
+      attr_reader :raw, :id, :flags, :questions, :qdcount, :ancount, :nscount, :arcount, :question_bytes
+
+      Question = Struct.new(:name, :qtype, :qclass)
+
+      def self.parse(raw)
+        raise ParseError, "dns header too short" if raw.nil? || raw.bytesize < 12
+
+        id, flags, qdcount, ancount, nscount, arcount = raw.unpack("n6")
+        offset = 12
+        questions = []
+
+        qdcount.times do
+          name, offset = read_name(raw, offset)
+          raise ParseError, "truncated question" if raw.bytesize < offset + 4
+
+          qtype, qclass = raw.byteslice(offset, 4).unpack("n2")
+          offset += 4
+          questions << Question.new(name, qtype, qclass)
+        end
+
+        question_bytes = raw.byteslice(12, offset - 12) || +""
+
+        new(
+          raw: raw,
+          id: id,
+          flags: flags,
+          qdcount: qdcount,
+          ancount: ancount,
+          nscount: nscount,
+          arcount: arcount,
+          questions: questions,
+          question_bytes: question_bytes
+        )
+      end
+
+      def initialize(raw:, id:, flags:, qdcount:, ancount:, nscount:, arcount:, questions:, question_bytes:)
+        @raw = raw
+        @id = id
+        @flags = flags
+        @qdcount = qdcount
+        @ancount = ancount
+        @nscount = nscount
+        @arcount = arcount
+        @questions = questions
+        @question_bytes = question_bytes
+      end
+
+      def question
+        questions.first
+      end
+
+      def qr?
+        (flags & 0x8000) != 0
+      end
+
+      def opcode
+        (flags & 0x7800) >> 11
+      end
+
+      def rd?
+        (flags & 0x0100) != 0
+      end
+
+      def cd?
+        (flags & 0x0010) != 0
+      end
+
+      def rcode
+        flags & 0x000F
+      end
+
+      def qname
+        question&.name
+      end
+
+      def qtype
+        question&.qtype
+      end
+
+      def qclass
+        question&.qclass
+      end
+
+      def cache_key
+        [qname.to_s.downcase, qtype.to_i, qclass.to_i].join("|")
+      end
+
+      def cache_ttl_seconds(negative_ttl_seconds:)
+        ttls = self.class.extract_ttls(raw)
+
+        if rcode == 3
+          return negative_ttl_seconds if ttls.empty?
+
+          ttls.min
+        end
+
+        return 0 if rcode != 0
+        return 0 if ttls.empty?
+
+        ttls.min
+      end
+
+      def self.read_name(data, offset, depth = 0)
+        raise ParseError, "name compression loop" if depth > 20
+        raise ParseError, "name offset out of bounds" if offset >= data.bytesize
+
+        labels = []
+        original_offset = offset
+        jumped = false
+
+        loop do
+          raise ParseError, "truncated name" if offset >= data.bytesize
+
+          length = data.getbyte(offset)
+          offset += 1
+
+          if (length & 0xC0) == 0xC0
+            raise ParseError, "truncated compression pointer" if offset >= data.bytesize
+
+            pointer = ((length & 0x3F) << 8) | data.getbyte(offset)
+            offset += 1
+            jumped = true
+
+            pointed_name, _ = read_name(data, pointer, depth + 1)
+            labels << pointed_name unless pointed_name.empty?
+            break
+          elsif length.zero?
+            break
+          else
+            raise ParseError, "truncated label" if data.bytesize < offset + length
+
+            labels << data.byteslice(offset, length)
+            offset += length
+          end
+        end
+
+        [labels.reject(&:empty?).join("."), jumped ? offset : offset]
+      end
+
+      def self.skip_name(data, offset)
+        _name, next_offset = read_name(data, offset)
+        next_offset
+      end
+
+      def self.extract_ttls(raw)
+        _id, _flags, qdcount, ancount, nscount, arcount = raw.unpack("n6")
+        offset = 12
+
+        qdcount.times do
+          offset = skip_name(raw, offset)
+          raise ParseError, "truncated question rr" if raw.bytesize < offset + 4
+
+          offset += 4
+        end
+
+        ttls = []
+
+        (ancount + nscount + arcount).times do
+          offset = skip_name(raw, offset)
+          raise ParseError, "truncated rr" if raw.bytesize < offset + 10
+
+          _type, _klass, ttl, rdlength = raw.byteslice(offset, 10).unpack("n n N n")
+          offset += 10
+          raise ParseError, "truncated rdata" if raw.bytesize < offset + rdlength
+
+          ttls << ttl
+          offset += rdlength
+        end
+
+        ttls
+      rescue ParseError
+        []
+      end
+
+      def self.response_flags_for(query, rcode:, recursion_available: true)
+        qr = 0x8000
+        opcode = query.flags & 0x7800
+        rd = query.flags & 0x0100
+        cd = query.flags & 0x0010
+        ra = recursion_available ? 0x0080 : 0
+        qr | opcode | rd | cd | ra | (rcode & 0x000F)
+      end
+
+      def self.build_error_response(query, rcode:, recursion_available: true)
+        flags = response_flags_for(query, rcode: rcode, recursion_available: recursion_available)
+        header = [
+          query.id,
+          flags,
+          query.qdcount,
+          0,
+          0,
+          0
+        ].pack("n6")
+
+        header + query.question_bytes
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/json_logger.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class JsonLogger
+    LEVELS = {
+      "debug" => Logger::DEBUG,
+      "info" => Logger::INFO,
+      "warn" => Logger::WARN,
+      "error" => Logger::ERROR
+    }.freeze
+
+    def initialize(io: $stdout, level: "info", json: true)
+      @logger = Logger.new(io)
+      @logger.level = LEVELS.fetch(level.to_s.downcase, Logger::INFO)
+      @json = json
+
+      @logger.formatter = proc do |severity, datetime, _progname, msg|
+        if @json
+          payload = msg.is_a?(Hash) ? msg.dup : { message: msg.to_s }
+          payload[:severity] ||= severity
+          payload[:timestamp] ||= datetime.utc.iso8601
+          JSON.generate(payload) + "\n"
+        else
+          "[#{datetime.utc.iso8601}] #{severity} #{msg}\n"
+        end
+      end
+    end
+
+    def debug(payload)
+      @logger.debug(payload)
+    end
+
+    def info(payload)
+      @logger.info(payload)
+    end
+
+    def warn(payload)
+      @logger.warn(payload)
+    end
+
+    def error(payload)
+      @logger.error(payload)
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/metrics.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class Metrics
+    def initialize
+      @counters = Hash.new(0)
+      @histograms = Hash.new { |h, k| h[k] = { sum: 0.0, count: 0 } }
+      @mutex = Mutex.new
+    end
+
+    def increment(name, labels = {}, by: 1)
+      key = metric_key(name, labels)
+      @mutex.synchronize do
+        @counters[key] += by
+      end
+    end
+
+    def observe(name, value, labels = {})
+      key = metric_key(name, labels)
+      @mutex.synchronize do
+        @histograms[key][:sum] += value.to_f
+        @histograms[key][:count] += 1
+      end
+    end
+
+    def render_prometheus
+      lines = []
+      @mutex.synchronize do
+        @counters.each do |(name, labels), value|
+          lines << "#{name}#{format_labels(labels)} #{value}"
+        end
+
+        @histograms.each do |(name, labels), payload|
+          lines << "#{name}_sum#{format_labels(labels)} #{payload[:sum]}"
+          lines << "#{name}_count#{format_labels(labels)} #{payload[:count]}"
+        end
+      end
+      lines.join("\n") + "\n"
+    end
+
+    private
+
+    def metric_key(name, labels)
+      [name.to_s, normalize_labels(labels)]
+    end
+
+    def normalize_labels(labels)
+      labels.sort_by { |k, _| k.to_s }.to_h
+    end
+
+    def format_labels(labels)
+      return "" if labels.empty?
+
+      content = labels.map { |k, v| %(#{k}="#{v}") }.join(",")
+      "{#{content}}"
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/metrics_server.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class MetricsServer
+    def initialize(enabled:, bind_address:, port:, metrics:, logger:)
+      @enabled = enabled
+      @bind_address = bind_address
+      @port = port
+      @metrics = metrics
+      @logger = logger
+      @server = nil
+      @thread = nil
+    end
+
+    def start
+      return unless @enabled
+
+      @server = WEBrick::HTTPServer.new(
+        BindAddress: @bind_address,
+        Port: @port,
+        Logger: WEBrick::Log.new(File::NULL),
+        AccessLog: []
+      )
+
+      @server.mount_proc("/metrics") do |_req, res|
+        res.status = 200
+        res["Content-Type"] = "text/plain; version=0.0.4"
+        res.body = @metrics.render_prometheus
+      end
+
+      @server.mount_proc("/healthz") do |_req, res|
+        res.status = 200
+        res["Content-Type"] = "text/plain"
+        res.body = "ok\n"
+      end
+
+      @thread = Thread.new { @server.start }
+      @logger.info(event: "metrics_server_started", bind_address: @bind_address, port: @port)
+    end
+
+    def stop
+      @server&.shutdown
+      @thread&.kill
+      @thread&.join
+    rescue StandardError
+      nil
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/query_processor.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class QueryProcessor
+    RCODE_MAP = {
+      "NOERROR" => 0,
+      "FORMERR" => 1,
+      "SERVFAIL" => 2,
+      "NXDOMAIN" => 3,
+      "NOTIMP" => 4,
+      "REFUSED" => 5
+    }.freeze
+
+    def initialize(cache:, blocklist:, rate_limiter:, router:, logger:, metrics:, policy_config:)
+      @cache = cache
+      @blocklist = blocklist
+      @rate_limiter = rate_limiter
+      @router = router
+      @logger = logger
+      @metrics = metrics
+      @policy_config = policy_config
+    end
+
+    def process(raw_query, protocol:, client_ip:)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      metrics.increment("dnsserve_queries_total", protocol: protocol)
+
+      query = DNS::Message.parse(raw_query)
+      qname = query.qname.to_s.downcase
+      qtype = query.qtype.to_i
+
+      unless rate_limiter.allow?(client_ip)
+        metrics.increment("dnsserve_policy_drops_total", reason: "rate_limit")
+        logger.warn(
+          event: "query_rate_limited",
+          client_ip: client_ip,
+          protocol: protocol,
+          qname: qname,
+          qtype: qtype
+        )
+        return DNS::Message.build_error_response(query, rcode: 5)
+      end
+
+      if qname.empty? || query.qdcount != 1 || query.qr?
+        metrics.increment("dnsserve_invalid_queries_total")
+        return DNS::Message.build_error_response(query, rcode: 1)
+      end
+
+      if blocklist.blocked?(qname)
+        metrics.increment("dnsserve_policy_drops_total", reason: "blocklist")
+        logger.info(
+          event: "query_blocked",
+          client_ip: client_ip,
+          protocol: protocol,
+          qname: qname,
+          qtype: qtype
+        )
+        rcode = RCODE_MAP.fetch(policy_config.fetch(:block_response_code), 5)
+        return DNS::Message.build_error_response(query, rcode: rcode)
+      end
+
+      cached = cache.fetch(query)
+      if cached
+        metrics.increment("dnsserve_cache_hits_total")
+        metrics.observe("dnsserve_query_latency_seconds", Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, protocol: protocol, result: "cache_hit")
+        return cached
+      end
+
+      metrics.increment("dnsserve_cache_misses_total")
+      upstream_raw = router.query(raw_query)
+      response = DNS::Message.parse(upstream_raw)
+
+      cache.write(query, response) if response.rcode == 0 || response.rcode == 3
+
+      metrics.observe(
+        "dnsserve_query_latency_seconds",
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) - started,
+        protocol: protocol,
+        result: "upstream"
+      )
+
+      logger.info(
+        event: "query_processed",
+        client_ip: client_ip,
+        protocol: protocol,
+        qname: qname,
+        qtype: qtype,
+        rcode: response.rcode
+      )
+
+      upstream_raw
+    rescue DNS::ParseError => e
+      metrics.increment("dnsserve_invalid_queries_total")
+      logger.warn(
+        event: "query_parse_error",
+        client_ip: client_ip,
+        protocol: protocol,
+        error_class: e.class.name,
+        error: e.message
+      )
+      begin
+        fallback_query = DNS::Message.parse(raw_query)
+        DNS::Message.build_error_response(fallback_query, rcode: 1)
+      rescue StandardError
+        ""
+      end
+    rescue StandardError => e
+      metrics.increment("dnsserve_processing_failures_total")
+      logger.error(
+        event: "query_processing_failed",
+        client_ip: client_ip,
+        protocol: protocol,
+        error_class: e.class.name,
+        error: e.message
+      )
+      begin
+        fallback_query = DNS::Message.parse(raw_query)
+        DNS::Message.build_error_response(fallback_query, rcode: 2)
+      rescue StandardError
+        ""
+      end
+    end
+
+    private
+
+    attr_reader :cache, :blocklist, :rate_limiter, :router, :logger, :metrics, :policy_config
+  end
+end
+
+===== FILE: lib/dnsserve/rate_limiter.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class RateLimiter
+    def initialize(enabled:, requests_per_second_per_client:, burst:)
+      @enabled = enabled
+      @rate = requests_per_second_per_client.to_i
+      @burst = burst.to_i
+      @buckets = {}
+      @mutex = Mutex.new
+    end
+
+    def enabled?
+      @enabled
+    end
+
+    def allow?(client_ip)
+      return true unless enabled?
+
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      key = client_ip.to_s
+
+      @mutex.synchronize do
+        bucket = (@buckets[key] ||= {
+          tokens: @burst.to_f,
+          updated_at: now
+        })
+
+        elapsed = now - bucket[:updated_at]
+        bucket[:updated_at] = now
+        bucket[:tokens] = [@burst.to_f, bucket[:tokens] + (elapsed * @rate)].min
+
+        if bucket[:tokens] >= 1.0
+          bucket[:tokens] -= 1.0
+          true
+        else
+          false
+        end
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/server.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class Server
+    def initialize(config)
+      @config = config
+      @logger = JsonLogger.new(
+        io: $stdout,
+        level: config.logging.fetch(:level, "info"),
+        json: config.logging.fetch(:json, true)
+      )
+      @metrics = Metrics.new
+
+      @cache = Cache.new(
+        enabled: config.cache.fetch(:enabled),
+        max_entries: config.cache.fetch(:max_entries),
+        min_ttl_seconds: config.cache.fetch(:min_ttl_seconds),
+        max_ttl_seconds: config.cache.fetch(:max_ttl_seconds),
+        negative_ttl_seconds: config.cache.fetch(:negative_ttl_seconds)
+      )
+
+      @blocklist = Blocklist.new(
+        blocklist_path: config.resolve_path(config.policy.fetch(:blocklist_path)),
+        allowlist_path: config.resolve_path(config.policy.fetch(:allowlist_path))
+      )
+
+      rate_limit = config.policy.fetch(:rate_limit)
+      @rate_limiter = RateLimiter.new(
+        enabled: rate_limit.fetch(:enabled),
+        requests_per_second_per_client: rate_limit.fetch(:requests_per_second_per_client),
+        burst: rate_limit.fetch(:burst)
+      )
+
+      @router = Upstream::Router.new(config.upstreams, logger: @logger, metrics: @metrics)
+
+      @processor = QueryProcessor.new(
+        cache: @cache,
+        blocklist: @blocklist,
+        rate_limiter: @rate_limiter,
+        router: @router,
+        logger: @logger,
+        metrics: @metrics,
+        policy_config: config.policy
+      )
+
+      @udp_server = UdpServer.new(
+        bind_address: config.server.fetch(:bind_address),
+        port: config.server.fetch(:port),
+        worker_count: config.server.fetch(:udp_workers),
+        processor: @processor,
+        logger: @logger,
+        metrics: @metrics,
+        max_udp_packet_size: config.server.fetch(:max_udp_packet_size)
+      )
+
+      @tcp_server = TcpServer.new(
+        bind_address: config.server.fetch(:bind_address),
+        port: config.server.fetch(:port),
+        backlog: config.server.fetch(:tcp_backlog),
+        client_timeout_seconds: config.server.fetch(:tcp_client_timeout_seconds),
+        processor: @processor,
+        logger: @logger,
+        metrics: @metrics
+      )
+
+      @metrics_server = MetricsServer.new(
+        enabled: config.metrics.fetch(:enabled),
+        bind_address: config.metrics.fetch(:bind_address),
+        port: config.metrics.fetch(:port),
+        metrics: @metrics,
+        logger: @logger
+      )
+    end
+
+    def start
+      trap_signals
+      logger.info(event: "dnsserve_starting", version: DNServe::VERSION)
+      @metrics_server.start
+      @udp_server.start
+      @tcp_server.start
+      sleep
+    end
+
+    def stop
+      logger.info(event: "dnsserve_stopping")
+      @tcp_server.stop
+      @udp_server.stop
+      @metrics_server.stop
+    end
+
+    private
+
+    attr_reader :logger
+
+    def trap_signals
+      %w[INT TERM].each do |signal|
+        Signal.trap(signal) do
+          stop
+          exit(0)
+        end
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/tcp_server.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class TcpServer
+    def initialize(bind_address:, port:, backlog:, client_timeout_seconds:, processor:, logger:, metrics:)
+      @bind_address = bind_address
+      @port = port
+      @backlog = backlog
+      @client_timeout_seconds = client_timeout_seconds
+      @processor = processor
+      @logger = logger
+      @metrics = metrics
+      @running = false
+      @server = nil
+      @accept_thread = nil
+      @client_threads = []
+    end
+
+    def start
+      @running = true
+      @server = ::TCPServer.new(@bind_address, @port)
+      @server.listen(@backlog)
+
+      @accept_thread = Thread.new { accept_loop }
+      logger.info(event: "tcp_server_started", bind_address: @bind_address, port: @port, backlog: @backlog)
+    end
+
+    def stop
+      @running = false
+      @server&.close
+      @accept_thread&.kill
+      @accept_thread&.join
+      @client_threads.each(&:kill)
+      @client_threads.each(&:join)
+    rescue StandardError
+      nil
+    end
+
+    private
+
+    attr_reader :logger, :metrics
+
+    def accept_loop
+      while @running
+        begin
+          client = @server.accept
+          thread = Thread.new(client) { |socket| handle_client(socket) }
+          @client_threads << thread
+        rescue IOError, SystemCallError
+          break unless @running
+        rescue StandardError => e
+          logger.error(event: "tcp_accept_error", error_class: e.class.name, error: e.message)
+        end
+      end
+    end
+
+    def handle_client(client)
+      client_ip = client.peeraddr[3]
+      logger.info(event: "tcp_client_connected", client_ip: client_ip)
+
+      loop do
+        raw_query = read_dns_message(client, @client_timeout_seconds)
+        break if raw_query.nil? || raw_query.empty?
+
+        response = @processor.process(raw_query, protocol: "tcp", client_ip: client_ip)
+        break if response.nil? || response.empty?
+
+        frame = [response.bytesize].pack("n") + response
+        write_all(client, frame, @client_timeout_seconds)
+      end
+    rescue EOFError, IOError, SystemCallError => e
+      logger.debug(event: "tcp_client_closed", client_ip: client_ip, error_class: e.class.name, error: e.message)
+    rescue StandardError => e
+      logger.error(event: "tcp_client_error", client_ip: client_ip, error_class: e.class.name, error: e.message)
+    ensure
+      client.close rescue nil
+    end
+
+    def read_dns_message(io, timeout_seconds)
+      header = read_exact(io, 2, timeout_seconds)
+      return nil if header.nil? || header.empty?
+
+      length = header.unpack1("n")
+      read_exact(io, length, timeout_seconds)
+    end
+
+    def read_exact(io, length, timeout_seconds)
+      buffer = +""
+      while buffer.bytesize < length
+        ready = IO.select([io], nil, nil, timeout_seconds)
+        raise IOError, "tcp client read timeout" unless ready
+
+        chunk = io.read_nonblock(length - buffer.bytesize, exception: false)
+        case chunk
+        when :wait_readable
+          next
+        when nil
+          raise EOFError, "tcp client disconnected"
+        else
+          buffer << chunk
+        end
+      end
+      buffer
+    end
+
+    def write_all(io, data, timeout_seconds)
+      until data.empty?
+        ready = IO.select(nil, [io], nil, timeout_seconds)
+        raise IOError, "tcp client write timeout" unless ready
+
+        written = io.write_nonblock(data, exception: false)
+        case written
+        when :wait_writable
+          next
+        when Integer
+          data = data.byteslice(written, data.bytesize - written) || +""
+        else
+          raise IOError, "unexpected tcp write result: #{written.inspect}"
+        end
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/udp_server.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  class UdpServer
+    def initialize(bind_address:, port:, worker_count:, processor:, logger:, metrics:, max_udp_packet_size:)
+      @bind_address = bind_address
+      @port = port
+      @worker_count = worker_count
+      @processor = processor
+      @logger = logger
+      @metrics = metrics
+      @max_udp_packet_size = max_udp_packet_size
+      @queue = Queue.new
+      @running = false
+      @socket = nil
+      @threads = []
+    end
+
+    def start
+      @running = true
+      @socket = UDPSocket.new
+      @socket.bind(@bind_address, @port)
+
+      @threads << Thread.new { listen_loop }
+      @worker_count.times do
+        @threads << Thread.new { worker_loop }
+      end
+
+      logger.info(event: "udp_server_started", bind_address: @bind_address, port: @port, workers: @worker_count)
+    end
+
+    def stop
+      @running = false
+      @socket&.close
+      @threads.each(&:kill)
+      @threads.each(&:join)
+    rescue StandardError
+      nil
+    end
+
+    private
+
+    attr_reader :logger, :metrics
+
+    def listen_loop
+      while @running
+        begin
+          message, sender = @socket.recvfrom(@max_udp_packet_size)
+          @queue << [message, sender]
+        rescue IOError, SystemCallError
+          break unless @running
+        rescue StandardError => e
+          logger.error(event: "udp_listener_error", error_class: e.class.name, error: e.message)
+        end
+      end
+    end
+
+    def worker_loop
+      while @running
+        begin
+          raw_query, sender = @queue.pop
+          port = sender[1]
+          client_ip = sender[3]
+          response = @processor.process(raw_query, protocol: "udp", client_ip: client_ip)
+          next if response.nil? || response.empty?
+
+          @socket.send(response, 0, client_ip, port)
+        rescue IOError, SystemCallError => e
+          logger.warn(event: "udp_worker_io_error", error_class: e.class.name, error: e.message)
+        rescue StandardError => e
+          logger.error(event: "udp_worker_error", error_class: e.class.name, error: e.message)
+        end
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/upstream/dot_pool.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  module Upstream
+    class DoTConnection
+      attr_reader :config
+
+      def initialize(config)
+        @config = config
+        @mutex = Mutex.new
+        @tcp_socket = nil
+        @ssl_socket = nil
+      end
+
+      def query(raw_query)
+        @mutex.synchronize do
+          ensure_connected!
+          write_frame(raw_query)
+          read_frame
+        rescue StandardError
+          close
+          raise
+        end
+      end
+
+      def close
+        @ssl_socket&.close
+      rescue StandardError
+        nil
+      ensure
+        @ssl_socket = nil
+        @tcp_socket = nil
+      end
+
+      private
+
+      def ensure_connected!
+        return if @ssl_socket && !@ssl_socket.closed?
+
+        close
+
+        @tcp_socket = Socket.tcp(
+          config.fetch(:address),
+          config.fetch(:port),
+          connect_timeout: config.fetch(:connect_timeout_seconds)
+        )
+
+        context = OpenSSL::SSL::SSLContext.new
+        context.min_version = OpenSSL::SSL::TLS1_2_VERSION if defined?(OpenSSL::SSL::TLS1_2_VERSION)
+        context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        context.set_params
+
+        @ssl_socket = OpenSSL::SSL::SSLSocket.new(@tcp_socket, context)
+        @ssl_socket.hostname = config.fetch(:sni_hostname)
+        @ssl_socket.sync_close = true
+
+        Timeout.timeout(config.fetch(:connect_timeout_seconds)) do
+          @ssl_socket.connect
+        end
+
+        @ssl_socket.post_connection_check(config.fetch(:sni_hostname))
+      end
+
+      def write_frame(raw_query)
+        frame = [raw_query.bytesize].pack("n") + raw_query
+        write_timeout = config.fetch(:write_timeout_seconds)
+
+        until frame.empty?
+          ready = IO.select(nil, [@ssl_socket], nil, write_timeout)
+          raise IOError, "upstream write timeout" unless ready
+
+          written = @ssl_socket.write_nonblock(frame, exception: false)
+          case written
+          when :wait_writable
+            next
+          when Integer
+            frame = frame.byteslice(written, frame.bytesize - written) || +""
+          else
+            raise IOError, "unexpected write result: #{written.inspect}"
+          end
+        end
+      end
+
+      def read_frame
+        read_timeout = config.fetch(:read_timeout_seconds)
+        header = read_exact(2, read_timeout)
+        length = header.unpack1("n")
+        read_exact(length, read_timeout)
+      end
+
+      def read_exact(length, timeout_seconds)
+        buffer = +""
+        while buffer.bytesize < length
+          ready = IO.select([@ssl_socket], nil, nil, timeout_seconds)
+          raise IOError, "upstream read timeout" unless ready
+
+          chunk = @ssl_socket.read_nonblock(length - buffer.bytesize, exception: false)
+          case chunk
+          when :wait_readable
+            next
+          when nil
+            raise EOFError, "upstream closed connection"
+          else
+            buffer << chunk
+          end
+        end
+        buffer
+      end
+    end
+
+    class DoTPool
+      def initialize(config, logger:, metrics:)
+        @config = config
+        @logger = logger
+        @metrics = metrics
+        @queue = Queue.new
+        @created = 0
+        @mutex = Mutex.new
+        @failure_count = 0
+        @last_failure_at = nil
+      end
+
+      def name
+        config.fetch(:name)
+      end
+
+      def available?
+        return true if @last_failure_at.nil?
+        return true if (Process.clock_gettime(Process::CLOCK_MONOTONIC) - @last_failure_at) >= config.fetch(:failure_cooldown_seconds)
+
+        false
+      end
+
+      def query(raw_query)
+        connection = checkout
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        response = connection.query(raw_query)
+        observe_success(started)
+        response
+      rescue StandardError => e
+        observe_failure(e)
+        raise
+      ensure
+        checkin(connection) if connection
+      end
+
+      private
+
+      attr_reader :config, :logger, :metrics
+
+      def checkout
+        return @queue.pop(true) unless @queue.empty?
+
+        @mutex.synchronize do
+          if @created < config.fetch(:pool_size)
+            @created += 1
+            return DoTConnection.new(config)
+          end
+        end
+
+        @queue.pop
+      rescue ThreadError
+        retry
+      end
+
+      def checkin(connection)
+        return if connection.nil?
+
+        @queue << connection
+      end
+
+      def observe_success(started)
+        latency = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        @failure_count = 0
+        @last_failure_at = nil
+        metrics.increment("dnsserve_upstream_queries_total", upstream: name, result: "success")
+        metrics.observe("dnsserve_upstream_latency_seconds", latency, upstream: name)
+      end
+
+      def observe_failure(error)
+        @failure_count += 1
+        @last_failure_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        metrics.increment("dnsserve_upstream_queries_total", upstream: name, result: "failure")
+        logger.warn(
+          event: "upstream_query_failed",
+          upstream: name,
+          error_class: error.class.name,
+          error: error.message
+        )
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/upstream/router.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  module Upstream
+    class Router
+      def initialize(upstreams, logger:, metrics:)
+        @pools = upstreams.map do |entry|
+          DoTPool.new(entry, logger: logger, metrics: metrics)
+        end
+        @logger = logger
+        @metrics = metrics
+        @rr_index = 0
+        @mutex = Mutex.new
+      end
+
+      def query(raw_query)
+        ordered_pools.each do |pool|
+          next unless pool.available?
+
+          return pool.query(raw_query)
+        rescue StandardError => e
+          @logger.warn(
+            event: "upstream_failover",
+            upstream: pool.name,
+            error_class: e.class.name,
+            error: e.message
+          )
+          next
+        end
+
+        raise IOError, "all upstreams unavailable"
+      end
+
+      private
+
+      def ordered_pools
+        @mutex.synchronize do
+          start = @rr_index % @pools.length
+          @rr_index += 1
+          @pools.rotate(start)
+        end
+      end
+    end
+  end
+end
+
+===== FILE: lib/dnsserve/version.rb =====
+# frozen_string_literal: true
+
+module DNServe
+  VERSION = "1.0.0"
+end
+
+===== FILE: spec/blocklist_spec.rb =====
+# frozen_string_literal: true
+
+require "spec_helper"
+require "tempfile"
+
+RSpec.describe DNServe::Blocklist do
+  it "matches exact and suffix domains and honors allowlist" do
+    block = Tempfile.new("blocklist")
+    allow = Tempfile.new("allowlist")
+
+    block.write("bad.example\nads.example\n")
+    block.flush
+
+    allow.write("safe.bad.example\n")
+    allow.flush
+
+    list = described_class.new(blocklist_path: block.path, allowlist_path: allow.path)
+
+    expect(list.blocked?("bad.example")).to be(true)
+    expect(list.blocked?("www.bad.example")).to be(true)
+    expect(list.blocked?("safe.bad.example")).to be(false)
+    expect(list.blocked?("ok.example")).to be(false)
+  ensure
+    block.close!
+    allow.close!
+  end
+end
+
+===== FILE: spec/cache_spec.rb =====
+# frozen_string_literal: true
+
+require "spec_helper"
+
+RSpec.describe DNServe::Cache do
+  let(:cache) do
+    described_class.new(
+      enabled: true,
+      max_entries: 10,
+      min_ttl_seconds: 1,
+      max_ttl_seconds: 60,
+      negative_ttl_seconds: 30
+    )
+  end
+
+  let(:query_raw) { "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01".b }
+  let(:response_raw) { "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01".b }
+
+  it "returns cached response with caller transaction id" do
+    query = DNServe::DNS::Message.parse(query_raw)
+    response = DNServe::DNS::Message.parse(response_raw)
+
+    cache.write(query, response)
+
+    another_query = DNServe::DNS::Message.parse(query_raw.sub("\x12\x34".b, "\xBE\xEF".b))
+    cached = cache.fetch(another_query)
+
+    expect(cached.byteslice(0, 2)).to eq("\xBE\xEF".b)
+  end
+end
+
+===== FILE: spec/message_spec.rb =====
+# frozen_string_literal: true
+
+require "spec_helper"
+
+RSpec.describe DNServe::DNS::Message do
+  let(:query_raw) { "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01".b }
+
+  it "parses basic dns question" do
+    msg = described_class.parse(query_raw)
+
+    expect(msg.id).to eq(0x1234)
+    expect(msg.qname).to eq("example.com")
+    expect(msg.qtype).to eq(1)
+    expect(msg.qclass).to eq(1)
+    expect(msg.qdcount).to eq(1)
+  end
+
+  it "builds error response" do
+    msg = described_class.parse(query_raw)
+    response = described_class.build_error_response(msg, rcode: 5)
+    parsed = described_class.parse(response)
+
+    expect(parsed.id).to eq(msg.id)
+    expect(parsed.qr?).to be(true)
+    expect(parsed.rcode).to eq(5)
+  end
+end
+
+===== FILE: spec/spec_helper.rb =====
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+require "dnsserve"
+
+RSpec.configure do |config|
+  config.disable_monkey_patching!
+  config.order = :random
+end
+
+===== FILE: systemd/dnsserve.service =====
+[Unit]
+Description=DNServe secure DNS forwarding server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dnsserve
+ExecStart=/usr/bin/env bundle exec bin/dnsserve -c config/default.yml
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+
